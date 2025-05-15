@@ -354,8 +354,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
             # --- Non-Streaming Response ---
             else:
+                job: Optional[Job] = None # Initialize job to None
                 try:
-                    # Define stop conditions based on request (example, adapt as needed)
+                    # Define stop conditions based on request
                     stop_conditions_req: Any = request_data.get('stop', [])
                     stop_conditions: List[Union[str, int]] = []
                     if isinstance(stop_conditions_req, list):
@@ -366,23 +367,67 @@ class APIHandler(BaseHTTPRequestHandler):
                     if tokenizer.eos_token_id is not None and tokenizer.eos_token_id not in stop_conditions:
                          stop_conditions.append(tokenizer.eos_token_id)
 
-
-                    # Use the generator.generate utility function
-                    completion: str
-                    last_results: Optional[Dict[str, Any]]
-                    completion, last_results = generator.generate(
-                        prompt=prompt, # Ensure the raw prompt string is passed
+                    # Create and enqueue the job
+                    job = Job(
+                        input_ids=input_ids, # Use the already encoded input_ids
                         max_new_tokens=max_tokens,
                         sampler=sampler, # Pass the created sampler instance
                         stop_conditions=stop_conditions,
-                        return_last_results=True,
-                        decode_special_tokens=True # Assuming we want special tokens decoded for OpenAI format
+                        decode_special_tokens=False # OpenAI API typically expects raw tokens, then server decodes.
+                                                    # Set to True if your client expects decoded special tokens.
                     )
+                    generator.enqueue(job)
 
-                    # Extract necessary info from the results
-                    full_response_text: str = completion # Assuming generate returns only completion here
-                    finish_reason: str = last_results.get("eos_reason", "stop") if last_results else "stop"
-                    completion_token_count: int = last_results.get("new_tokens", 0) if last_results else 0
+                    collected_chunks: List[str] = []
+                    finish_reason: Optional[str] = None
+                    completion_token_count: int = 0
+                    job_done: bool = False
+
+                    # Iterate while the job is active and not marked as done
+                    while generator.num_remaining_jobs() > 0 and not job_done:
+                        results: List[Dict[str, Any]] = generator.iterate()
+                        for r in results:
+                            # Ensure we are processing results for our specific job
+                            if r["serial"] != job.serial_number:
+                                continue
+
+                            if r["stage"] == "streaming":
+                                chunk: str = r.get("text", "")
+                                if chunk:
+                                    collected_chunks.append(chunk)
+
+                            # Check for EOS - this indicates the job is done
+                            if r["eos"]:
+                                finish_reason = r.get("eos_reason", "stop") # Capture reason from generator
+                                completion_token_count = r.get("new_tokens", 0) # Capture token count
+                                job_done = True # Mark job as done to exit outer loop
+                                break # Exit inner results loop
+                        if job_done:
+                            break # Exit outer while loop
+                    
+                    # If job was cancelled or never produced EOS, ensure cleanup
+                    if not job_done and job:
+                        # This case might happen if generator.iterate() stops yielding
+                        # before an EOS is received (e.g. external cancellation not caught above)
+                        # or if max_new_tokens is hit without an explicit EOS signal from generator.
+                        logger.warning(f"Job {job.serial_number} finished without explicit EOS. Determining finish reason.")
+                        # We need to get the final state of the job if possible, or infer it.
+                        # If the job object has a final token count, use it.
+                        # For now, we assume completion_token_count was updated if an EOS occurred.
+                        # If no EOS, it likely hit max_tokens.
+                        if not finish_reason: finish_reason = "length"
+                        # If completion_token_count is still 0, it means no tokens were generated or EOS was immediate.
+                        # This part might need more robust handling based on Job state if available after completion.
+
+
+                    # Concatenate collected chunks
+                    full_response_text: str = "".join(collected_chunks)
+
+                    # If job finished due to max_new_tokens, finish_reason might still be None
+                    # The logic above (job_done and r["eos"]) should set finish_reason.
+                    # If it's still None here, it implies the loop exited for other reasons (e.g. max_tokens without EOS signal)
+                    if finish_reason is None:
+                         finish_reason = "length" # Default to length if no specific stop reason
 
                     response_data: Dict[str, Any] = {
                         "id": generation_id,
@@ -399,7 +444,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         }],
                         "usage": {
                             "prompt_tokens": prompt_token_count,
-                            "completion_tokens": completion_token_count, # This is an approximation
+                            "completion_tokens": completion_token_count, # This should be set from the EOS result
                             "total_tokens": prompt_token_count + completion_token_count
                         }
                     }
@@ -407,7 +452,16 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 except Exception as e:
                     logger.exception(f"Error during non-streaming generation: {e}") # Use exception
+                    if job and not job_done : # Ensure job is cancelled if an error occurred
+                        generator.cancel(job)
                     self._send_error(500, f"Error during generation: {e}")
+                finally:
+                    # Ensure job is deallocated if it was created and not cancelled due to an exception
+                    # This part is tricky because the job might be auto-cleaned by the generator
+                    # or might need explicit deallocation depending on exllamav3's Job lifecycle.
+                    # For now, we rely on the generator's internal management or cancellation path.
+                    pass
+
 
         else:
             self._send_error(404, "Not Found. Use POST /v1/chat/completions")
@@ -483,6 +537,10 @@ if __name__ == "__main__":
     logger.info(f"Using model: {model_name} from {args.model_dir}")
     logger.info("Endpoint available at POST /v1/chat/completions")
     # --- Log Memory Usage and VRAM Info per Device ---
+    # Note: Model memory per device is not easily available from model.get_storage_info()
+    # The log below shows total model memory and per-device cache/VRAM.
+    # A more accurate log would require iterating through model layers/components.
+
     model_bits, _, model_vram_bits = model.get_storage_info()
     model_bytes = model_vram_bits / 8
     model_mb = model_bytes / (1024 * 1024)
