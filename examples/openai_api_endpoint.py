@@ -28,7 +28,8 @@ try:
     from exllamav3.tokenizer.tokenizer import Tokenizer # Keep for potential type hinting
     from exllamav3.generator.generator import Generator # Import the base Generator class
     from exllamav3.generator.sampler.sampler import Sampler # Base sampler class
-    from exllamav3.generator.sampler.custom import CustomSampler, SS_Temperature, SS_TopP, SS_TopK, SS_Sample # Custom sampler components
+    from exllamav3.generator.sampler.custom import CustomSampler
+    from exllamav3.generator.sampler.stages import SS_Temperature, SS_TopP, SS_TopK, SS_Sample # Custom sampler stage components
     from exllamav3.generator.job import Job # Import Job class
     import torch
 except ImportError as e:

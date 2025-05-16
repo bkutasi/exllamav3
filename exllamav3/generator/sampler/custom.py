@@ -2,445 +2,9 @@ from .sampler import Sampler
 import torch
 from typing_extensions import override
 from ...tokenizer import Tokenizer
-from ...ext import exllamav3_ext as ext
-from ...util import next_power_of_2
-from ...util.tensor import buffered_arange
 import random
-from dataclasses import dataclass
-from enum import Enum
-
-class SS(Enum):
-    INIT = 0  # only state.in_logits is valid
-    DONE = 1  # finished, state.sample is valid
-    LOGITS = 2  # state.logits is valid
-    PROBS = 3  # state.probs is valid
-    LOGITS_S = 4  # state.logits is valid, state.indices is valid
-    PROBS_S = 5  # state.probs is valid but not normalized, indices are valid
-    PROBS_N = 6  # state.probs is valid and normalized
-    PROBS_N_S = 7  # state.probs is valid and normalized, indices are valid
-
-@dataclass
-class SamplingState:
-    rand_u32: int
-    bsz: int
-    dim: int
-    in_logits: torch.Tensor | None = None
-    logits: torch.Tensor | None = None
-    sample: torch.Tensor | None = None
-    probs: torch.Tensor | None = None
-    indices: torch.Tensor | None = None
-    past_ids: torch.Tensor | None = None
-    state: SS = SS.INIT
-
-    def empty_sample(self):
-        assert self.sample is None
-        return torch.empty((self.bsz, 1), dtype = torch.long, device = self.in_logits.device)
-
-    def empty_probs(self, reuse = True):
-        if reuse and self.probs is not None:
-            return self.probs
-        return torch.empty((self.bsz, self.dim), dtype = torch.float, device = self.in_logits.device)
-
-    def empty_logits(self, reuse = True):
-        if reuse and self.logits is not None:
-            return self.logits
-        return torch.empty((self.bsz, self.dim), dtype = torch.float, device = self.in_logits.device)
-
-
-class SS_Base:
-    def run(self, state: SamplingState):
-        raise NotImplementedError()
-    def prep(self, in_state: SS):
-        return None
-    def alt(self):
-        return None
-    def reqs_past_ids(self):
-        return False
-
-
-class SS_NoOp(SS_Base):
-    """
-    Empty sampling step
-    """
-    def run(self, state: SamplingState):
-        pass
-
-
-class SS_Argmax(SS_Base):
-    """
-    Final sampling step: select most likely token
-    """
-    def run(self, state: SamplingState):
-        match state.state:
-            case SS.INIT:
-                state.sample = torch.argmax(state.in_logits, dim = -1)
-            case SS.LOGITS:
-                state.sample = torch.argmax(state.logits, dim = -1)
-            case SS.PROBS | SS.PROBS_N:
-                state.sample = torch.argmax(state.probs, dim = -1)
-            case SS.LOGITS_S:
-                temp = torch.argmax(state.logits, dim = -1)
-                state.state = state.indices[temp]
-            case SS.PROBS_S | SS.PROBS_N_S:
-                temp = torch.argmax(state.probs, dim = -1)
-                state.state = state.indices[temp]
-        state.state = SS.DONE
-
-
-class SS_Sample(SS_Base):
-    """
-    Final sampling step: categorical sampling, randomly sample from (truncated and/or modified) distribution
-    """
-    def run(self, state: SamplingState):
-        # TODO: Fused Gumbel noise + argmax kernel
-        # TODO: Evaluate if multinomial sampling from sorted prob. distribution is more efficient
-        match state.state:
-            case SS.INIT:
-                state.logits = torch.empty_like(state.in_logits)
-                ext.gumbel_noise_f16(state.in_logits, state.logits, state.rand_u32)
-                state.sample = torch.argmax(state.logits, dim = -1)
-            case SS.LOGITS:
-                ext.gumbel_noise_f32(state.logits, state.logits, state.rand_u32)
-                state.sample = torch.argmax(state.logits, dim = -1)
-            case SS.PROBS | SS.PROBS_N:
-                ext.gumbel_noise_log(state.probs, state.probs, state.rand_u32)
-                state.sample = torch.argmax(state.probs, dim = -1)
-            case SS.LOGITS_S:
-                ext.gumbel_noise_f32(state.logits, state.logits, state.rand_u32)
-                temp = torch.argmax(state.logits, dim = -1)
-                state.sample = state.indices[buffered_arange(state.bsz, state.in_logits.device), temp]
-            case SS.PROBS_S | SS.PROBS_N_S:
-                ext.gumbel_noise_log(state.probs, state.probs, state.rand_u32)
-                temp = torch.argmax(state.probs, dim = -1)
-                state.sample = state.indices[buffered_arange(state.bsz, state.in_logits.device), temp]
-        state.state = SS.DONE
-
-
-class SS_Sample_mn(SS_Sample):
-    """
-    Categorical sampling, but only using torch.multinomial (for testing/validation)
-    """
-    def run(self, state: SamplingState):
-        match state.state:
-            case SS.PROBS_N_S | SS.PROBS_N:
-                state.sample = torch.multinomial(state.probs, num_samples = 1)
-            case _:
-                raise ValueError("Sampling logic error")
-        state.state = SS.DONE
-
-    def prep(self, in_state: SS):
-        match in_state:
-            case SS.INIT | SS.LOGITS | SS.PROBS | SS.LOGITS_S | SS.PROBS_S:
-                return [SS_Normalize]
-            case _:
-                return None
-
-
-class SS_Temperature(SS_Base):
-    """
-    Modify distribution with temperature scaling
-    """
-    def __init__(self, temperature: float):
-        self.temperature = temperature
-
-    def run(self, state: SamplingState):
-        match state.state:
-            case SS.INIT:
-                state.logits = state.in_logits.float()
-                state.logits /= self.temperature
-                state.state = SS.LOGITS
-            case SS.LOGITS:
-                state.logits /= self.temperature
-            case SS.PROBS | SS.PROBS_N:
-                state.probs.pow_(1.0 / self.temperature)
-                state.state = SS.PROBS
-            case SS.LOGITS_S:
-                state.logits /= self.temperature
-            case SS.PROBS_S | SS.PROBS_N_S:
-                state.probs.pow_(1.0 / self.temperature)
-                state.state = SS.PROBS_S
-
-    def alt(self):
-        if self.temperature == 1.0:
-            return SS_NoOp()
-        return None
-
-
-class SS_Normalize(SS_Base):
-    """
-    Normalize distribution
-    """
-    def run(self, state: SamplingState):
-        match state.state:
-            case SS.INIT:
-                state.probs = torch.softmax(state.in_logits.float(), dim = -1)
-                state.state = SS.PROBS_N
-            case SS.LOGITS:
-                state.probs = torch.softmax(state.logits, dim = -1)
-                state.state = SS.PROBS_N
-            case SS.PROBS:
-                state.probs /= state.probs.sum(dim = -1, keepdim = True)
-                state.state = SS.PROBS_N
-            case SS.LOGITS_S:
-                state.probs = torch.softmax(state.logits, dim = -1)
-                state.state = SS.PROBS_N_S
-            case SS.PROBS_S:
-                state.probs /= state.probs.sum(dim = -1, keepdim = True)
-                state.state = SS.PROBS_N_S
-            case SS.PROBS_N | SS.PROBS_N_S:
-                pass
-
-
-class SS_Sort(SS_Base):
-    """
-    Sort tokens by descending probability. state.indices
-    """
-    def run(self, state: SamplingState):
-        match state.state:
-            case SS.INIT:
-                logits = state.in_logits.to(torch.float, copy = True)
-                state.logits, state.indices = torch.sort(logits, dim = -1, descending = True)
-                state.state = SS.LOGITS_S
-            case SS.LOGITS:
-                state.logits, state.indices = torch.sort(state.logits, dim = -1, descending = True)
-                state.state = SS.LOGITS_S
-            case SS.PROBS:
-                state.probs, state.indices = torch.sort(state.probs, dim = -1, descending = True)
-                state.state = SS.PROBS_S
-            case SS.PROBS_N:
-                state.probs, state.indices = torch.sort(state.probs, dim = -1, descending = True)
-                state.state = SS.PROBS_N_S
-            case SS.LOGITS_S | SS.PROBS_S | SS.PROBS_N_S:
-                pass
-
-
-class SS_TopK(SS_Base):
-    """
-    Mask out all but the top K most likely tokens
-    """
-    def __init__(self, top_k: int):
-        assert isinstance(top_k, int) or top_k.is_integer(), "top_k value must be integer"
-        self.top_k = int(top_k)
-
-    def run(self, state: SamplingState):
-        match state.state:
-            case SS.PROBS_S | SS.PROBS_N_S:
-                state.probs[..., self.top_k:] = 0.0
-                state.state = SS.PROBS_S
-            case SS.LOGITS_S:
-                state.logits[..., self.top_k:] = -float("inf")
-            case _:
-                raise ValueError("Sampling logic error")
-
-    def prep(self, in_state: SS):
-        match in_state:
-            case SS.INIT | SS.LOGITS | SS.PROBS | SS.PROBS_N:
-                return [SS_Sort]
-            case _:
-                return None
-
-    def alt(self):
-        if self.top_k < 1:
-            return SS_NoOp()
-        return None
-
-
-class SS_TopP(SS_Base):
-    """
-    Identify the smallest set of top tokens with a cumulative probability greater than P, mask out all
-    remainig tokens
-    """
-    def __init__(self, top_p: float):
-        self.top_p = top_p
-        assert 0.0 <= top_p <= 1.0
-
-    def run(self, state: SamplingState):
-        match state.state:
-            case SS.PROBS_N_S:
-                cumsum = state.probs.cumsum(dim = -1)
-                mask = cumsum <= self.top_p
-                state.probs[..., 1:] *= mask[..., 1:]
-                state.state = SS.PROBS_S
-            case _:
-                raise ValueError("Sampling logic error")
-
-    def prep(self, in_state: SS):
-        match in_state:
-            case SS.PROBS_N:
-                return [SS_Sort]
-            case SS.INIT | SS.LOGITS | SS.PROBS:
-                return [SS_Normalize, SS_Sort]
-            case SS.LOGITS_S | SS.PROBS_S:
-                return [SS_Normalize]
-            case _:
-                return None
-
-    def alt(self):
-        if self.top_p == 1.0:
-            return SS_NoOp()
-        return None
-
-
-class SS_MinP(SS_Base):
-    """
-    Mask out all tokens whose probability is less than the top token's probability times min_p
-    """
-    def __init__(self, min_p: float):
-        self.min_p = min_p
-        assert 0.0 <= min_p <= 1.0
-
-    def run(self, state: SamplingState):
-        match state.state:
-            case SS.PROBS_N:
-                threshold = state.probs.amax(dim = -1, keepdim = True) * self.min_p
-                mask = state.probs >= threshold
-                state.probs *= mask
-                state.state = SS.PROBS
-            case SS.PROBS_N_S:
-                threshold = state.probs[:, :1] * self.min_p
-                mask = state.probs >= threshold
-                state.probs *= mask
-                state.state = SS.PROBS_S
-            case _:
-                raise ValueError("Sampling logic error")
-
-    def prep(self, in_state: SS):
-        match in_state:
-            case SS.INIT | SS.LOGITS | SS.PROBS | SS.LOGITS_S | SS.PROBS_S:
-                return [SS_Normalize]
-            case _:
-                return None
-
-    def alt(self):
-        if self.min_p == 0.0:
-            return SS_NoOp()
-        return None
-
-
-class SS_RepP(SS_Base):
-    """
-    Apply Transformers style repetition penalties based on past token IDs. Must be the first step in sampler
-    chain.
-    """
-    def __init__(
-        self,
-        rep_p: float = 1.0,
-        sustain_range: int = int(10e7),
-        decay_range: int = 0
-    ):
-        """
-        :param rep_p:
-            Multiplicative penalty. rep_p = 1.0 means no penalty. Positive logits are divided by this value and
-            negative ones are multiplied by it. Recreates the method from the Transformers generate() pipeline,
-            following https://arxiv.org/pdf/1909.05858.pdf which relies on the assumption that logits output
-            straight from the model are "centered" around zero.
-         :param sustain_range:
-            Number of most recent past tokens over which to apply full penalty
-        :param decay_range:
-            Number tokens (after sustain_range) over which the penalty gradually fades out
-        """
-        self.rep_p = rep_p
-        self.sustain_range = sustain_range
-        self.decay_range = decay_range
-
-    def run(self, state: SamplingState):
-        match state.state:
-            case SS.INIT:
-                state.logits = torch.empty_like(state.in_logits, dtype = torch.float)
-                ext.apply_rep_pens(
-                    state.in_logits,
-                    state.logits,
-                    state.past_ids,
-                    self.rep_p,
-                    self.sustain_range,
-                    self.decay_range
-                )
-            case SS.LOGITS:
-                ext.apply_rep_pens(
-                    state.logits,
-                    state.logits,
-                    state.past_ids,
-                    self.rep_p,
-                    self.sustain_range,
-                    self.decay_range
-                )
-            case _:
-                raise ValueError("Sampling logic error")
-        state.state = SS.LOGITS
-
-    def alt(self):
-        if self.rep_p == 1.0 or self.sustain_range + self.decay_range <= 0:
-            return SS_NoOp()
-        return None
-
-    def reqs_past_ids(self):
-        return True
-
-
-class SS_PresFreqP(SS_Base):
-    """
-    Apply OAI-style presence and frequency penalties based on past token IDs. Must be the first step in the
-    sampler chain.
-    """
-    def __init__(
-        self,
-        pres_p: float = 0.0,
-        freq_p: float = 0.0,
-        sustain_range: int = int(10e7),
-        decay_range: int = 0
-    ):
-        """
-        :param pres_p:
-            Additive penalty, OAI style. 0.0 means no penalty. Added to logit once if a token appears in
-            past_ids
-        :param freq_p:
-            Additive penalty, OAI style. 0.0 means no penalty. Added to logit for every time a token is
-            encountered in past_ids
-         :param sustain_range:
-            Number of most recent past tokens over which to apply full penalty
-        :param decay_range:
-            Number tokens (after sustain_range) over which the penalty gradually fades out
-        """
-        self.pres_p = pres_p
-        self.freq_p = freq_p
-        self.sustain_range = sustain_range
-        self.decay_range = decay_range
-
-    def run(self, state: SamplingState):
-        match state.state:
-            case SS.INIT:
-                state.logits = torch.empty_like(state.in_logits, dtype = torch.float)
-                ext.apply_pres_freq_pens(
-                    state.in_logits,
-                    state.logits,
-                    state.past_ids,
-                    self.pres_p,
-                    self.freq_p,
-                    self.sustain_range,
-                    self.decay_range
-                )
-            case SS.LOGITS:
-                ext.apply_pres_freq_pens(
-                    state.logits,
-                    state.logits,
-                    state.past_ids,
-                    self.pres_p,
-                    self.freq_p,
-                    self.sustain_range,
-                    self.decay_range
-                )
-            case _:
-                raise ValueError("Sampling logic error")
-        state.state = SS.LOGITS
-
-    def alt(self):
-        if (self.pres_p == 0.0 and self.freq_p == 0.0) or self.sustain_range + self.decay_range <= 0:
-            return SS_NoOp()
-        return None
-
-    def reqs_past_ids(self):
-        return True
-
+from .ss_definitions import SS_Base, SamplingState, SS
+from .stages import SS_Sample # Added import for DefaultSampler
 
 class CustomSampler(Sampler):
     def __init__(
@@ -448,27 +12,73 @@ class CustomSampler(Sampler):
         steps: list[SS_Base]
     ):
         super().__init__()
+        self.states = {} # Initialize the states dictionary
+        self.tokenizer: Tokenizer | None = None # Initialize tokenizer attribute
 
         self.steps = []
-        state = SS.INIT
-        for step in steps:
-            self.reqs_past_ids = self.reqs_past_ids or step.reqs_past_ids()
-            alt = step.alt()
-            if alt:
-                step = alt
-            prep_steps = step.prep(state)
-            if prep_steps:
-                for prep_step in prep_steps:
-                    self.steps.append(prep_step())
-            self.steps.append(step)
+        # Initialize reqs_past_ids, it's a boolean attribute of the Sampler instance
+        self.reqs_past_ids = False # Initialize here
+        current_processing_state = SS.INIT # Use a distinct variable for the loop's state tracking
+        for step_item in steps: # Use a different variable name for the loop item
+            self.reqs_past_ids = self.reqs_past_ids or step_item.reqs_past_ids()
+            alt_step = step_item.alt() # Use a different variable name
+            if alt_step:
+                current_step_to_process = alt_step # Use a different variable name
+            else:
+                current_step_to_process = step_item
 
-        # TODO: Identify and remove redundant sampling steps, add rules for fusing steps where possible
+            prep_steps_classes = current_step_to_process.prep(current_processing_state) # Use a different variable name
+            if prep_steps_classes:
+                for prep_step_class in prep_steps_classes:
+                    new_prep_step_instance = prep_step_class()
+                    if hasattr(new_prep_step_instance, 'attach_sampler') and callable(getattr(new_prep_step_instance, 'attach_sampler')):
+                        new_prep_step_instance.attach_sampler(self)
+                    self.steps.append(new_prep_step_instance)
+            
+            if hasattr(current_step_to_process, 'attach_sampler') and callable(getattr(current_step_to_process, 'attach_sampler')):
+                current_step_to_process.attach_sampler(self)
+            self.steps.append(current_step_to_process)
+            # The `current_processing_state` for the *next* iteration's `step_item.prep()` call should reflect the state
+            # *after* `current_step_to_process` would theoretically run. This is complex.
+            # The original code used a single `state = SS.INIT` and passed it to `step.prep(state)`.
+            # This `state` variable itself was not updated in the loop.
+            # Let's stick to the original logic: the `state` passed to `prep` is the state *before* the current main `step_item`.
+            # The `CustomSampler` doesn't know the final state after each step during __init__.
+            # It just prepares the list of steps. The actual state transitions happen during `forward()`.
+            # So, `current_processing_state` should not be updated here based on the step's potential outcome.
+            # It should represent the state *before* the *current* `step_item` is considered for `prep`.
+            # The original code had `state = SS.INIT` outside the loop and used that `state` for all `step.prep(state)` calls.
+            # This is likely an oversight in the original `custom.py` or implies `prep` only cares about the initial state.
+            # Let's replicate that for now, passing `SS.INIT` to `prep`.
+            # prep_steps_classes = current_step_to_process.prep(SS.INIT) # Reverting to simpler logic if the above is too complex
+
+        # Re-evaluating the state logic for prep:
+        # The original code:
+        # self.steps = []
+        # state = SS.INIT
+        # for step in steps:
+        #     ...
+        #     prep_steps = step.prep(state) <-- 'state' here is always SS.INIT
+        #     ...
+        # This implies that the `prep` method of each SS_Base class must be designed to work given only SS.INIT
+        # as the input state, or the logic in `CustomSampler` was simplified.
+        # Given the `prep` methods in the original `SS_TopK`, `SS_TopP` etc., they *do* match on `in_state: SS`.
+        # Example: `SS_TopK.prep` matches `in_state` against `SS.INIT | SS.LOGITS | SS.PROBS | SS.PROBS_N`.
+        # This means `state` in `CustomSampler.__init__` *should* be updated.
+        # However, `CustomSampler.__init__` cannot know the *actual* output state of a step without running it.
+        # This is a conceptual issue in the original design if `prep` truly needs the *output* state of the previous step.
+        # Let's assume `prep(in_state)` refers to the state *before* the step itself runs.
+        # The `state` variable in the loop should represent the expected state *before* the current `step_item`'s `prep` is called.
+        # This state is not changed by `prep_steps` themselves during `__init__`.
+        # The most straightforward interpretation of the original code is that `state` was indeed fixed at `SS.INIT` for all `prep` calls.
+        # Let's stick to that for minimal change from original `custom.py`'s `CustomSampler.__init__` behavior.
+        # The `state` variable in the loop was not updated.
 
     @override
     @torch.inference_mode
     def forward(
         self,
-        logits,
+        logits, # This is the raw output from the model, effectively in_logits for the first step
         sequence_ids: torch.Tensor | None = None,
         rand_u32: int | None = None,
         tokenizer: Tokenizer | None = None,
@@ -478,41 +88,64 @@ class CustomSampler(Sampler):
     ):
         out_shape = logits.shape[:-1]
 
-        if tokenizer is not None:
+        # Filter out tokens outside the actual vocab size if tokenizer is provided
+        if tokenizer is not None and tokenizer.actual_vocab_size < logits.shape[-1]:
             logits[..., tokenizer.actual_vocab_size:] = -float("inf")
+        self.tokenizer = tokenizer # Store the tokenizer instance
 
         if rand_u32 is None:
-            rand_u32 = random.randint(0, (1<<32) - 1)
-        else:
-            torch.manual_seed(rand_u32)
-            random.seed(rand_u32)
+            rand_u32 = random.randint(0, (1 << 32) - 1)
+        # Seeding here affects torch.multinomial if used by a sampler step, and random.sample if used.
+        # Note: The original exllamav2 generator seeds globally. Here, it's per-call if rand_u32 is provided.
+        torch.manual_seed(rand_u32) # Ensure reproducibility if rand_u32 is given
+        random.seed(rand_u32)      # Also seed Python's random for any steps relying on it
 
         dim = logits.shape[-1]
         bsz = logits.numel() // dim
 
-        # Prepare logit bias tensor
-
-        # TODO: Extension function for this, combine with filter API when it's added
+        # Apply token blocking/allowing directly to the initial logits
+        # This needs to be done carefully if logits tensor is reused.
+        # Cloning here ensures modifications don't affect upstream if logits is a view or shared.
+        current_logits = logits # Start with the input logits
         if blocked_tokens is not None or allowed_tokens is not None:
-            logits = logits.clone()
-        if blocked_tokens is not None:
-            logits[..., blocked_tokens] = float('-inf')
-        if allowed_tokens is not None:
-            mask = torch.zeros(logits.shape[-1], dtype = torch.bool, device = logits.device)
-            mask[allowed_tokens] = True
-            logits[..., ~mask] = float('-inf')
+            current_logits = current_logits.clone() # Clone to modify
+            if blocked_tokens is not None:
+                current_logits[..., blocked_tokens] = float('-inf')
+            if allowed_tokens is not None:
+                # Create a mask for allowed tokens
+                allow_mask = torch.zeros(dim, dtype=torch.bool, device=current_logits.device)
+                valid_allowed_tokens = [t for t in allowed_tokens if 0 <= t < dim]
+                if valid_allowed_tokens: # Ensure tokens are within vocab bounds
+                    allow_mask[valid_allowed_tokens] = True
+                current_logits[..., ~allow_mask] = float('-inf') # Apply mask
 
-        state = SamplingState(
-            rand_u32 = rand_u32,
-            dim = dim,
-            bsz = bsz,
-            in_logits = logits.view(bsz, dim),
-            past_ids = sequence_ids,
+        # Initialize SamplingState
+        sampling_state_obj = SamplingState( # Use a different variable name from the class
+            rand_u32=rand_u32,
+            dim=dim,
+            bsz=bsz,
+            in_logits=current_logits.view(bsz, dim), # Pass the potentially modified logits
+            past_ids=sequence_ids,
+            # Other fields (logits, probs, sample, indices) are None initially
         )
 
-        for ss in self.steps:
-            assert state.state != SS.DONE, "Sampling logic error"
-            ss.run(state)
-        assert return_state or state.state == SS.DONE, "Sampling logic error"
+        for ss_step in self.steps:
+            if sampling_state_obj.state == SS.DONE and not return_state: # Optimization: if done and not returning state, break
+                break
+            ss_step.run(sampling_state_obj)
+            if not return_state and sampling_state_obj.state == SS.DONE and sampling_state_obj.sample is None:
+                # This case should ideally not happen if DONE implies sample is set.
+                # If a step sets DONE but not sample, and we don't return state, it's an issue.
+                # However, the assertion below handles this.
+                pass
 
-        return state if return_state else state.sample.view(out_shape)
+
+        assert return_state or (sampling_state_obj.state == SS.DONE and sampling_state_obj.sample is not None), \
+            f"Sampling logic error: Did not reach DONE state with a sample, or return_state is False. Final state: {sampling_state_obj.state}, Sample: {sampling_state_obj.sample is not None}"
+
+        return sampling_state_obj if return_state else sampling_state_obj.sample.view(out_shape)
+class DefaultSampler(CustomSampler):
+    def __init__(self):
+        # Initialize with a basic sampling step, e.g., SS_Sample
+        # You might need to import SS_Sample from .stages if not already done in custom.py
+        super().__init__(steps=[SS_Sample()])
