@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 import threading
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 # Configure logger
 logger: logging.Logger = logging.getLogger(__name__)
@@ -164,6 +164,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:
+        request_time_start: float = time.time() # Overall request timer
         global model, tokenizer, generator, model_name, cache # Ensure globals are accessible
 
         if self.path == '/v1/chat/completions':
@@ -181,6 +182,14 @@ class APIHandler(BaseHTTPRequestHandler):
             except Exception as e:
                  self._send_error(400, f"Error reading request: {e}")
                  return
+ 
+            # Initialize timing variables
+            time_init_phase_start: float = 0.0
+            time_init_phase_end_and_process_phase_start: float = 0.0
+            time_process_phase_end_and_generate_phase_start: float = 0.0
+            time_generate_phase_end: float = 0.0
+            time_request_end: float = 0.0
+            actual_completion_tokens: int = 0
 
             if not model or not tokenizer or not generator or not cache:
                  self._send_error(503, "Model is not initialized yet.")
@@ -200,7 +209,9 @@ class APIHandler(BaseHTTPRequestHandler):
             # Note: Add other sampler settings as needed (rep penalty, frequency/presence, etc.)
             requested_model_name: str = request_data.get('model', model_name) # Use loaded model name if not specified
 
+            # DRY Sampler parameters and logging removed.
             # --- Prepare Prompt ---
+            time_init_phase_start = time.time() # Start of init phase
             try:
                 prompt: str = format_chat_prompt(messages)
                 # Encode prompt to get input IDs
@@ -235,6 +246,7 @@ class APIHandler(BaseHTTPRequestHandler):
             if 0 < top_p < 1.0:
                  sampler_steps.append(SS_TopP(top_p))
             # Add the final sampling step (e.g., SS_Sample for random sampling)
+            # SS_DRY sampler step removed.
             sampler_steps.append(SS_Sample()) # Or SS_Argmax() for greedy
 
             sampler: CustomSampler = CustomSampler(sampler_steps)
@@ -256,7 +268,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 finish_reason: Optional[str] = None
                 job_done: bool = False
                 job: Optional[Job] = None # Initialize job to None
+
+                # Performance timing specific to streaming
+                first_token_processed_stream: bool = False
+                # actual_completion_tokens is declared above, will be stream_completion_tokens here
+                stream_completion_tokens: int = 0
+
                 try:
+                    time_init_phase_end_and_process_phase_start = time.time() # End of init (job creation below), start of process (enqueue + prefill)
                     # Define stop conditions based on request
                     stop_conditions_req: Any = request_data.get('stop', [])
                     stop_conditions: List[Union[str, int]] = []
@@ -289,6 +308,9 @@ class APIHandler(BaseHTTPRequestHandler):
                                 continue
 
                             if r["stage"] == "streaming":
+                                if not first_token_processed_stream and r.get("text", ""):
+                                    time_process_phase_end_and_generate_phase_start = time.time() # End of process, start of token generation
+                                    first_token_processed_stream = True
                                 chunk: str = r.get("text", "")
                                 if chunk: # Only send if there's text
                                     stream_chunk: Dict[str, Any] = {
@@ -312,6 +334,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
                                 # Check for EOS - this is now the primary way to set finish_reason in the loop
                                 if r["eos"]:
+                                    time_generate_phase_end = time.time() # End of token generation
+                                    stream_completion_tokens = r.get("new_tokens", 0)
+                                    actual_completion_tokens = stream_completion_tokens
                                     finish_reason = r.get("eos_reason", "stop") # Capture reason from generator
                                     job_done = True
                                     break # Exit inner results loop
@@ -334,6 +359,22 @@ class APIHandler(BaseHTTPRequestHandler):
                     }
                     self._send_sse_chunk(final_chunk)
                     self._send_sse_chunk("[DONE]")
+
+                    time_request_end = time.time()
+                    # Calculate and log performance
+                    init_s: float = time_init_phase_end_and_process_phase_start - time_init_phase_start if time_init_phase_start > 0 and time_init_phase_end_and_process_phase_start > time_init_phase_start else 0.0
+                    process_s: float = time_process_phase_end_and_generate_phase_start - time_init_phase_end_and_process_phase_start if first_token_processed_stream and time_process_phase_end_and_generate_phase_start > time_init_phase_end_and_process_phase_start else 0.0
+                    generate_s: float = time_generate_phase_end - time_process_phase_end_and_generate_phase_start if first_token_processed_stream and time_generate_phase_end > time_process_phase_end_and_generate_phase_start else 0.0
+                    total_s: float = time_request_end - request_time_start if request_time_start > 0 and time_request_end > request_time_start else 0.0
+
+                    ctx_limit_val: int = cache.max_num_tokens if cache else 0
+                    prompt_len: int = prompt_token_count
+                    max_new_tokens_req: int = max_tokens
+
+                    process_tps: float = prompt_len / process_s if process_s > 0.001 else 0.0
+                    generate_tps: float = actual_completion_tokens / generate_s if generate_s > 0.001 else 0.0
+
+                    logger.info(f"CtxLimit:{prompt_len}/{ctx_limit_val}, Amt:{actual_completion_tokens}/{max_new_tokens_req}, Init:{init_s:.2f}s, Process:{process_s:.2f}s ({process_tps:.2f}T/s), Generate:{generate_s:.2f}s ({generate_tps:.2f}T/s), Total:{total_s:.2f}s")
                     return
 
                 except Exception as e:
@@ -353,9 +394,15 @@ class APIHandler(BaseHTTPRequestHandler):
 
 
             # --- Non-Streaming Response ---
-            else:
+            else: # Non-Streaming Response
                 job: Optional[Job] = None # Initialize job to None
+
+                # Performance timing specific to non-streaming
+                first_token_processed_non_stream: bool = False
+                # actual_completion_tokens is declared above
+
                 try:
+                    time_init_phase_end_and_process_phase_start = time.time() # End of init (job creation below), start of process (enqueue + prefill)
                     # Define stop conditions based on request
                     stop_conditions_req: Any = request_data.get('stop', [])
                     stop_conditions: List[Union[str, int]] = []
@@ -392,12 +439,17 @@ class APIHandler(BaseHTTPRequestHandler):
                                 continue
 
                             if r["stage"] == "streaming":
+                                if not first_token_processed_non_stream and r.get("text", ""):
+                                    time_process_phase_end_and_generate_phase_start = time.time() # End of process, start of generation
+                                    first_token_processed_non_stream = True
                                 chunk: str = r.get("text", "")
                                 if chunk:
                                     collected_chunks.append(chunk)
 
                             # Check for EOS - this indicates the job is done
                             if r["eos"]:
+                                time_generate_phase_end = time.time() # End of generation
+                                # completion_token_count is captured below for non-streaming
                                 finish_reason = r.get("eos_reason", "stop") # Capture reason from generator
                                 completion_token_count = r.get("new_tokens", 0) # Capture token count
                                 job_done = True # Mark job as done to exit outer loop
@@ -448,7 +500,24 @@ class APIHandler(BaseHTTPRequestHandler):
                             "total_tokens": prompt_token_count + completion_token_count
                         }
                     }
+                    actual_completion_tokens = response_data["usage"]["completion_tokens"] # Get from usage dict
                     self._send_json_response(200, response_data)
+
+                    time_request_end = time.time()
+                    # Calculate and log performance
+                    init_s: float = time_init_phase_end_and_process_phase_start - time_init_phase_start if time_init_phase_start > 0 and time_init_phase_end_and_process_phase_start > time_init_phase_start else 0.0
+                    process_s: float = time_process_phase_end_and_generate_phase_start - time_init_phase_end_and_process_phase_start if first_token_processed_non_stream and time_process_phase_end_and_generate_phase_start > time_init_phase_end_and_process_phase_start else 0.0
+                    generate_s: float = time_generate_phase_end - time_process_phase_end_and_generate_phase_start if first_token_processed_non_stream and time_generate_phase_end > time_process_phase_end_and_generate_phase_start else 0.0
+                    total_s: float = time_request_end - request_time_start if request_time_start > 0 and time_request_end > request_time_start else 0.0
+
+                    ctx_limit_val: int = cache.max_num_tokens if cache else 0
+                    prompt_len: int = prompt_token_count
+                    max_new_tokens_req: int = max_tokens
+
+                    process_tps: float = prompt_len / process_s if process_s > 0.001 else 0.0
+                    generate_tps: float = actual_completion_tokens / generate_s if generate_s > 0.001 else 0.0
+
+                    logger.info(f"CtxLimit:{prompt_len}/{ctx_limit_val}, Amt:{actual_completion_tokens}/{max_new_tokens_req}, Init:{init_s:.2f}s, Process:{process_s:.2f}s ({process_tps:.2f}T/s), Generate:{generate_s:.2f}s ({generate_tps:.2f}T/s), Total:{total_s:.2f}s")
 
                 except Exception as e:
                     logger.exception(f"Error during non-streaming generation: {e}") # Use exception
