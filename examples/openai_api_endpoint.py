@@ -646,7 +646,7 @@ if __name__ == "__main__":
                     # Include cache memory for this device in the log
                     cache_mb_this_device = cache_bytes_per_device.get(device_idx, 0) / (1024 * 1024)
 
-                    logger.info(f"Device {device_idx} ({device_name}): VRAM Free: {free_mb:.2f} MB / Total: {total_mb:.2f} MB, Cache on this device: {cache_mb_this_device:.2f} MB")
+                    logger.info(f"Device {device_idx} ({device_name}): VRAM Free: {free_mb:.2f} MB / Total: {total_mb:.2f} MB, Cache: {cache_mb_this_device:.2f} MB")
             else:
                 logger.info("No CUDA devices found in cache layers, skipping per-device VRAM/Cache info logging.")
         else:
